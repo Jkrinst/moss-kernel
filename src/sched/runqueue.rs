@@ -1,4 +1,5 @@
 use core::cmp::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::{
     drivers::timer::Instant,
@@ -8,6 +9,8 @@ use alloc::{boxed::Box, collections::btree_map::BTreeMap};
 use log::warn;
 
 use super::{VCLOCK_EPSILON, sched_task::SchedulableTask};
+
+static RR_ENQUEUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The result of a requested task switch.
 pub enum SwitchResult {
@@ -108,8 +111,8 @@ impl RunQueue {
         TaskDescriptor::this_cpus_idle()
     }
 
-    /// Returns the Descriptor of the best task to run next. This compares the
-    /// best task in the run_queue against the currently running task.
+    /// EEVDF: Returns the descriptor of the best task to run next, comparing
+    /// the best queued task against the currently running task by virtual deadline.
     pub fn find_next_runnable_desc(&self, vclock: u128) -> TaskDescriptor {
         // Find the best candidate from the Run Queue
         let best_queued_entry = self
@@ -122,29 +125,21 @@ impl RunQueue {
 
         let (best_queued_desc, best_queued_task) = match best_queued_entry {
             Some((d, t)) => (*d, t),
-            // If runqueue is empty (or no eligible tasks), we might just run
-            // current or idle.
             None => return self.fallback_current_or_idle(),
         };
 
         // Compare against the current task
         if let Some(current) = self.current() {
-            // If current is not Runnable (e.g. it blocked, yielded, or
-            // finished), it cannot win.
             let current_state = *current.state.lock_save_irq();
             if current_state != TaskState::Runnable && current_state != TaskState::Running {
                 return best_queued_desc;
             }
 
-            // compare current vs challenger
             match current.compare_with(best_queued_task) {
                 Ordering::Less | Ordering::Equal => {
-                    // Current is better (has earlier deadline) or equal. Keep
-                    // running current.
                     return current.descriptor();
                 }
                 Ordering::Greater => {
-                    // Queued task is better. Switch.
                     return best_queued_desc;
                 }
             }
@@ -153,17 +148,33 @@ impl RunQueue {
         best_queued_desc
     }
 
+    pub fn find_next_runnable_desc_rr(&self) -> TaskDescriptor {
+        let best = self
+            .queue
+            .iter()
+            .filter(|(_, t)| {
+                !t.is_idle_task()
+                    && *t.state.lock_save_irq() == TaskState::Runnable
+            })
+            .min_by_key(|(_, t)| t.rr_seq);
+
+        match best {
+            Some((desc, _)) => *desc,
+            None => self.fallback_current_or_idle(),
+        }
+    }
+
     /// Inserts `task` into this CPU's run-queue.
-    pub fn enqueue_task(&mut self, new_task: Box<SchedulableTask>) {
+    pub fn enqueue_task(&mut self, mut new_task: Box<SchedulableTask>) {
         if !new_task.is_idle_task() {
             self.total_weight = self.total_weight.saturating_add(new_task.weight() as u64);
+            new_task.rr_seq = RR_ENQUEUE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         }
 
         if let Some(old_task) = self.queue.insert(new_task.descriptor(), new_task) {
-            // Handle the edge case where we overwrite a task. If we replaced
-            // someone, we must subtract their weight to avoid accounting drift.
             warn!("Overwrote active task {:?}", old_task.descriptor());
             self.total_weight = self.total_weight.saturating_sub(old_task.weight() as u64);
         }
     }
+
 }

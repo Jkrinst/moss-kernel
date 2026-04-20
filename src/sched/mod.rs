@@ -90,25 +90,6 @@ pub const VCLOCK_EPSILON: u128 = VT_ONE;
 /// effective weight (`w_i` in EEVDF paper).
 pub const SCHED_WEIGHT_BASE: i32 = 1024;
 
-/// Schedule a new task.
-///
-/// This function is the core of the kernel's scheduler. It is responsible for
-/// deciding which process to run next.
-///
-/// # Logic:
-/// 1. Finds the highest-priority, `Runnable` process in the system.
-/// 2. The idle task (PID 0, lowest priority) serves as a fallback if no other
-///    process is runnable.
-/// 3. If the selected process is the same as the currently running one, no
-///    switch occurs.
-/// 4. If a new process is selected, it handles the state transitions (`Running`
-///   > `Runnable` for the old task, `Runnable` > `Running` for the new task)
-///   > and performs the architecture-specific context switch.
-///
-/// # Returns
-///
-/// Nothing, but the CPU context will be set to the next runnable task. See
-/// `userspace_return` for how this is invoked.
 fn schedule() {
     // Reentrancy Check
     if SCHED_STATE.try_borrow_mut().is_none() {
@@ -137,7 +118,6 @@ const WAITING_SHIFT: u32 = WEIGHT_SHIFT + 24;
 
 #[cfg(feature = "smp")]
 fn get_best_cpu() -> CpuId {
-    // Get the CPU with the least number of tasks.
     let least_tasked_cpu_info = LEAST_TASKED_CPU_INFO.load(Ordering::Acquire);
     CpuId::from_value((least_tasked_cpu_info & 0xffff) as usize)
 }
@@ -168,7 +148,6 @@ pub struct SchedState {
     run_q: RunQueue,
     wait_q: BTreeMap<TaskDescriptor, Box<SchedulableTask>>,
     /// Per-CPU virtual clock (fixed-point 65.63 stored in a u128).
-    /// Expressed in virtual-time units as defined by the EEVDF paper.
     vclock: u128,
     /// Real-time moment when `vclock` was last updated.
     last_update: Option<Instant>,
@@ -189,7 +168,6 @@ impl SchedState {
         }
     }
 
-    /// Update the global least-tasked CPU info atomically.
     #[cfg(feature = "smp")]
     fn update_global_least_tasked_cpu_info(&self) {
         fn none<T>() -> Option<T> {
@@ -200,7 +178,6 @@ impl SchedState {
             static LAST_UPDATE: Option<Instant> = none;
         }
 
-        // Try and throttle contention on the atomic variable.
         const MIN_COOLDOWN: Duration = Duration::from_millis(16);
         if let Some(last) = LAST_UPDATE.borrow().as_ref()
             && let Some(now) = now()
@@ -217,9 +194,7 @@ impl SchedState {
             | ((weight & 0xffffff) << WEIGHT_SHIFT)
             | ((waiting_tasks & 0xffffff) << WAITING_SHIFT);
         let mut old_info = LEAST_TASKED_CPU_INFO.load(Ordering::Acquire);
-        // Ensure we don't spin forever (possible with a larger number of CPUs)
         const MAX_RETRIES: usize = 8;
-        // Ensure consistency
         for _ in 0..MAX_RETRIES {
             let old_cpu_id = old_info & 0xffff;
             let old_weight = (old_info >> WEIGHT_SHIFT) & 0xffffff;
@@ -245,11 +220,6 @@ impl SchedState {
         // No-op on single-core systems.
     }
 
-    /// Advance the per-CPU virtual clock (`vclock`) by converting the elapsed
-    /// real time since the last update into 65.63-format fixed-point
-    /// virtual-time units:
-    ///     v += (delta t << VT_FIXED_SHIFT) /  sum w
-    /// The caller must pass the current real time (`now_inst`).
     fn advance_vclock(&mut self, now_inst: Instant) {
         if let Some(prev) = self.last_update {
             let delta_real = now_inst - prev;
@@ -270,10 +240,6 @@ impl SchedState {
         new_task.inserting_into_runqueue(self.vclock);
 
         if let Some(current) = self.run_q.current() {
-            // We force a reschedule if:
-            //
-            // We are currently idling, OR The new task has an earlier deadline
-            // than the current task.
             if current.is_idle_task() || new_task.v_deadline < current.v_deadline {
                 self.force_resched = true;
             }
@@ -298,7 +264,7 @@ impl SchedState {
 
     pub fn do_schedule(&mut self) {
         self.update_global_least_tasked_cpu_info();
-        // Update Clocks
+
         let now_inst = now().expect("System timer not initialised");
 
         self.advance_vclock(now_inst);
@@ -307,16 +273,19 @@ impl SchedState {
 
         if let Some(current) = self.run_q.current_mut() {
             current.update_accounting(Some(now_inst));
-            // Reset accounting baseline after updating stats to avoid double-counting
-            // the same time interval on the next scheduler tick.
             current.reset_last_account(now_inst);
-            // If the current task is IDLE, we always want to proceed to the
-            // scheduler core to see if a real task has arrived.
+
             if current.is_idle_task() {
                 needs_resched = true;
-            } else if current.tick(now_inst) {
-                // Otherwise, check if the real task expired
-                needs_resched = true;
+            } else {
+                #[cfg(feature = "rr_sched")]
+                if current.tick_rr(now_inst) {
+                    needs_resched = true;
+                }
+                #[cfg(not(feature = "rr_sched"))]
+                if current.tick(now_inst) {
+                    needs_resched = true;
+                }
             }
         } else {
             needs_resched = true;
@@ -326,34 +295,29 @@ impl SchedState {
             && let Some(current) = self.run_q.current()
             && matches!(*current.state.lock_save_irq(), TaskState::Running)
         {
-            // Fast Path: Only return if we have a valid task (Running state),
-            // it has budget, AND it's not the idle task.
             return;
         }
 
-        // Reset the force flag for next time.
         self.force_resched = false;
 
-        // Select Next Task.
+        // Select next task based on active scheduler.
+        #[cfg(feature = "rr_sched")]
+        let next_task_desc = self.run_q.find_next_runnable_desc_rr();
+        #[cfg(not(feature = "rr_sched"))]
         let next_task_desc = self.run_q.find_next_runnable_desc(self.vclock);
 
         match self.run_q.switch_tasks(next_task_desc, now_inst) {
             SwitchResult::AlreadyRunning => {
-                // Nothing to do.
                 return;
             }
             SwitchResult::Blocked { old_task } => {
-                // If the blocked task has finished, allow it to drop here so it's
-                // resources are released.
                 if !old_task.state.lock_save_irq().is_finished() {
                     self.wait_q.insert(old_task.descriptor(), old_task);
                 }
             }
-            // fall-thru.
             SwitchResult::Preempted => {}
         }
 
-        // Update all context since the task has switched.
         if let Some(new_current) = self.run_q.current_mut() {
             NUM_CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
             ArchImpl::context_switch(new_current.t_shared.clone());
@@ -394,7 +358,6 @@ pub fn sched_init_secondary() {
     let idle_task = ArchImpl::create_idle_task();
 
     insert_task(Box::new(idle_task));
-    // Force update_global_least_tasked_cpu_info
     SCHED_STATE.borrow().update_global_least_tasked_cpu_info();
 }
 

@@ -33,7 +33,7 @@ use super::Arch;
 
 mod boot;
 mod cpu_ops;
-mod exceptions;
+pub mod exceptions;
 mod fdt;
 mod memory;
 mod proc;

@@ -9,13 +9,15 @@
 #![reexport_test_harness_main = "test_main"]
 #![test_runner(crate::testing::test_runner)]
 
+
+
 use alloc::{
     boxed::Box,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
-use arch::{Arch, ArchImpl};
+use arch::{Arch, ArchImpl, init_syscall_history};
 use core::panic::PanicInfo;
 use drivers::{fdt_prober::get_fdt, fs::register_fs_drivers};
 use fs::VFS;
@@ -73,6 +75,7 @@ fn on_panic(info: &PanicInfo) -> ! {
     }
 
     ArchImpl::power_off();
+    loop {}
 }
 
 async fn launch_init(mut opts: KOptions) {
@@ -224,6 +227,7 @@ fn parse_args(args: &str) -> KOptions {
 }
 
 pub fn kmain(args: String, ctx_frame: *mut UserCtx) {
+    init_syscall_history();
     sched_init();
 
     register_fs_drivers();

@@ -1,3 +1,8 @@
+use crate::sync::SpinLock;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use ringbuf::{HeapRb, traits::{Consumer, Observer, RingBuffer}};
 use crate::{
     arch::{Arch, ArchImpl},
     clock::{
@@ -90,11 +95,21 @@ use crate::{
     },
     sched::{current::current_task, sys_sched_yield},
 };
-use alloc::boxed::Box;
+
 use libkernel::{
     error::{KernelError, syscall_error::kern_err_to_syscall},
     memory::address::{TUA, UA, VA},
 };
+
+const SYSCALL_HISTORY_SIZE: usize = 256;
+
+static LAST_SYSCALL_NR: AtomicU32 = AtomicU32::new(0);
+
+static SYSCALL_HISTORY: SpinLock<Option<HeapRb<u32>>> = SpinLock::new(None);
+
+pub fn init_syscall_history() {
+    *SYSCALL_HISTORY.lock_save_irq() = Some(HeapRb::new(SYSCALL_HISTORY_SIZE));
+}
 
 pub async fn handle_syscall() {
     current_task().update_accounting(None);
@@ -117,6 +132,13 @@ pub async fn handle_syscall() {
             state.x[5],
         )
     };
+
+    let prev_nr = LAST_SYSCALL_NR.load(AtomicOrdering::Relaxed);
+    LAST_SYSCALL_NR.store(nr, AtomicOrdering::Relaxed);
+
+if let Some(ref mut rb) = *SYSCALL_HISTORY.lock_save_irq() {
+    rb.push_overwrite(nr);
+}
 
     let res = match nr {
         0x5 => {
@@ -433,6 +455,21 @@ pub async fn handle_syscall() {
             )
             .await
         }
+        0x74 => {
+            log::info!("dmesg: syscall history (oldest to newest):");
+            if let Some(ref rb) = *SYSCALL_HISTORY.lock_save_irq() {
+                let mut history: Vec<u32> = Vec::new();
+                // iterate by peeking at occupied slots
+                for &syscall_nr in rb.iter() {
+                    history.push(syscall_nr);
+                }
+                for (i, syscall_nr) in history.iter().enumerate() {
+                    log::info!("  [{}] syscall 0x{:x}", i, syscall_nr);
+            }
+        }
+        log::info!("dmesg: previous syscall was 0x{:x}", prev_nr);
+        Ok(0)
+}
         0x75 => {
             sys_ptrace(
                 arg1 as _,

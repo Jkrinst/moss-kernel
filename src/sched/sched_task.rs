@@ -23,6 +23,10 @@ pub struct SchedulableTask {
     pub exec_start: Option<Instant>,
     pub deadline: Option<Instant>,
     pub last_run: Option<Instant>,
+    /// Sequence number assigned when task enters the run queue (used by RR).
+    pub rr_seq: u64,
+    /// When the current RR time slice started.
+    pub rr_slice_start: Option<Instant>,
 }
 
 impl Deref for SchedulableTask {
@@ -49,6 +53,8 @@ impl SchedulableTask {
             exec_start: None,
             deadline: None,
             last_run: None,
+            rr_seq: 0,
+            rr_slice_start: None,
         })
     }
 
@@ -81,12 +87,28 @@ impl SchedulableTask {
         // Has the task exceeded its deadline?
         if self.v_eligible >= self.v_deadline {
             self.replenish_deadline();
-
             true
         } else {
-            // Task still has budget. Do nothing. Return to userspace
-            // immediately.
             false
+        }
+    }
+
+    /// Round-robin tick: returns true if the fixed time slice has elapsed.
+    /// Does not use any virtual time or lag information.
+    pub fn tick_rr(&mut self, now: Instant) -> bool {
+        match self.rr_slice_start {
+            None => {
+                self.rr_slice_start = Some(now);
+                false
+            }
+            Some(start) => {
+                if now - start >= DEFAULT_TIME_SLICE {
+                    self.rr_slice_start = None; // reset for next slice
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -111,10 +133,6 @@ impl SchedulableTask {
         self.v_deadline
             .cmp(&other.v_deadline)
             .then_with(|| self.v_runtime.cmp(&other.v_runtime))
-            // If completely equal, prefer the one that hasn't run in a while?
-            // Or prefer the one already running to avoid cache thrashing?
-            // Usually irrelevant for EEVDF but strict ordering is good for
-            // stability.
             .then_with(|| match (self.last_run, other.last_run) {
                 (Some(a), Some(b)) => a.cmp(&b),
                 (Some(_), None) => Ordering::Less,

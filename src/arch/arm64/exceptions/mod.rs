@@ -26,7 +26,7 @@ use syscall::handle_syscall;
 use tock_registers::interfaces::Writeable;
 
 pub mod esr;
-mod syscall;
+pub mod syscall;
 
 unsafe extern "C" {
     pub static __vectors_start: u8;

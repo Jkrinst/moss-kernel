@@ -202,3 +202,8 @@ mod arm64;
 
 #[cfg(target_arch = "aarch64")]
 pub use self::arm64::Aarch64 as ArchImpl;
+
+#[cfg(target_arch = "aarch64")]
+pub fn init_syscall_history() {
+    self::arm64::exceptions::syscall::init_syscall_history();
+}
